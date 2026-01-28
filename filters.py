@@ -65,6 +65,37 @@ class NameFilter(FilterRule):
     # checks if the substring is in the name    
 
 
+class SpecificCASFilter(FilterRule):
+    """Filter flows by specific CAS number(s)"""
+    
+    def __init__(self, cas_numbers: list):
+        # Normalize CAS numbers on initialization
+        self.cas_numbers = [normalize_cas(cas) for cas in cas_numbers]
+    
+    def apply(self, flow: dict) -> bool:
+        casrn = normalize_cas(flow.get("CAS"))
+        return casrn in self.cas_numbers
+
+
+class ExcludeCompartmentFilter(FilterRule):
+    """Exclude flows that have any of the specified compartments"""
+    
+    def __init__(self, compartments: list):
+        # Store compartments as lowercase for case-insensitive comparison
+        self.compartments = [comp.lower() for comp in compartments]
+    
+    def apply(self, flow: dict) -> bool:
+        categories = flow.get("categories", [])
+        if not categories:
+            return True  # Keep flows with no categories
+        # Return True (keep) if NONE of the excluded compartments are in categories
+        return not any(
+            excluded_comp in cat.lower() 
+            for cat in categories 
+            for excluded_comp in self.compartments
+        )
+
+
 def apply_filter(df: pd.DataFrame, filter_rule: FilterRule) -> pd.DataFrame:
     """Apply a single filter rule to the dataframe and return filtered results"""
     # Convert dataframe rows to dict format for filtering
