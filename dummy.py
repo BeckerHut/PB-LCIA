@@ -42,17 +42,14 @@ def make_dummy_database(
             date = f"{start_year + year}-01-01"
             amount = np.random.randint(0, 6)  # Random integer between 0 and 5 (inclusive)
             
-            # Extract flow name - try multiple possible column names
-            flow_name = row.get('flow_name', row.get('name', ''))
-            flow_label = flow_name[:20] if pd.notna(flow_name) and len(str(flow_name)) > 0 else ''
-            
             temporal_row = {
                 'date': date,
                 'amount': amount,
                 'activity': 1,
-                'flow_name': flow_name,
+                'name': row.get('name', ''),
                 'categories': row.get('categories', ''),
                 'unit': row.get('unit', ''),
+                'CAS': row.get('CAS', ''),
             }
             temporal_data.append(temporal_row)
 
