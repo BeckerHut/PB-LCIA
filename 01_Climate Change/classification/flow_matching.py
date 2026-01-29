@@ -1,9 +1,8 @@
+import pandas as pd
+
 """
 Module for matching flows with CSV/AR6 data
 """
-
-import pandas as pd
-
 
 def match_flows(df_with_cas: pd.DataFrame, df_ar6: pd.DataFrame,
                 flow_cas_col: str, ar6_cas_col: str,
@@ -24,7 +23,6 @@ def match_flows(df_with_cas: pd.DataFrame, df_ar6: pd.DataFrame,
     
     lifetime_col = ar6_cols['lifetime']
     rad_eff_col = ar6_cols['rad_eff']
-    mol_col = ar6_cols['molar_mass']
     
     matching_flows = []
     non_matching_flows = []
@@ -41,7 +39,6 @@ def match_flows(df_with_cas: pd.DataFrame, df_ar6: pd.DataFrame,
             flow_data = row.to_dict()
             flow_data['Lifetime [years]'] = pd.to_numeric(match_row.get(lifetime_col), errors='coerce') if lifetime_col else None
             flow_data['Radiative_Efficiency [W m-2 ppb-1]'] = pd.to_numeric(match_row.get(rad_eff_col), errors='coerce') if rad_eff_col else None
-            flow_data['Molar_Mass [kg mol-1]'] = pd.to_numeric(match_row.get(mol_col), errors='coerce') if mol_col else None
             matching_flows.append(flow_data)
         else:
             # No match found

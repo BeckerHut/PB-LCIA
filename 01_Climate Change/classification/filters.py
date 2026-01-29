@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod # for creating an abstract base class
 from typing import Optional, Tuple, Dict, Any # for improving code readability
 from contextlib import closing # for context-managed SQLite connections
 
-# Import chemicals library (required for NMVOC classification)
+# Import chemicals library (required for VOC classification)
 try:
     from chemicals.phase_change import Tb, Tb_methods
     from chemicals.identifiers import MW
@@ -100,15 +100,15 @@ class SpecificCASFilter(FilterRule):
 
 
 class NameFilter(FilterRule):
-    """Filter flows by name substring (case-insensitive)"""
+    """Filter flows by multiple name substrings (case-insensitive, OR logic)"""
     
-    def __init__(self, substring: str):
-        self.substring = substring.lower()
+    def __init__(self, substrings: list):
+        self.substrings = [s.lower() for s in substrings]
     
     def apply(self, flow: dict) -> bool:
         name = flow.get("name", "").lower()
-        return self.substring in name
-    # checks if the substring is in the name    
+        return any(substring in name for substring in self.substrings)
+    # checks if ANY substring is in the name    
 
 
 
@@ -120,6 +120,8 @@ def apply_filter(df: pd.DataFrame, filter_rule: FilterRule) -> pd.DataFrame:
     """Apply a single filter rule to the dataframe and return filtered results"""
     # Convert dataframe rows to dict format for filtering
     filtered_rows = []
+    extra_cols = {}  # Store extra columns like carbon_atoms
+    
     for idx, row in df.iterrows():
         # Get categories (could be tuple or list from biosphere)
         categories = row["categories"]
@@ -136,8 +138,21 @@ def apply_filter(df: pd.DataFrame, filter_rule: FilterRule) -> pd.DataFrame:
         }
         if filter_rule.apply(flow_dict):
             filtered_rows.append(idx)
+            # Capture any extra columns added by the filter
+            for key in flow_dict:
+                if key not in ["name", "categories", "CAS"]:
+                    if key not in extra_cols:
+                        extra_cols[key] = {}
+                    extra_cols[key][idx] = flow_dict[key]
     
-    return df.loc[filtered_rows].reset_index(drop=True)
+    df_filtered = df.loc[filtered_rows].reset_index(drop=True)
+    
+    # Add extra columns to the filtered dataframe
+    for col_name, col_data in extra_cols.items():
+        # Map the indices back (filtered_rows contains original indices)
+        df_filtered[col_name] = [col_data.get(orig_idx) for orig_idx in filtered_rows]
+    
+    return df_filtered
 
 
 def normalize_cas(cas_string):
@@ -154,7 +169,7 @@ def normalize_cas(cas_string):
 
 
 # ============================================================================
-# NMVOC Classification Filter
+# VOC Classification Filter
 # ============================================================================
 
 # Configuration
@@ -178,7 +193,7 @@ EXCLUDE_METHODS_BY_DEFAULT = {
 # SQLite cache helpers
 
 def init_cache(db_path: str) -> sqlite3.Connection:
-    """Initialize SQLite cache for NMVOC classification results."""
+    """Initialize SQLite cache for VOC classification results."""
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
@@ -198,7 +213,7 @@ def init_cache(db_path: str) -> sqlite3.Connection:
 
 
 def cache_get(conn: sqlite3.Connection, cas: str) -> Optional[Dict[str, Any]]:
-    """Retrieve cached NMVOC classification result."""
+    """Retrieve cached VOC classification result."""
     cur = conn.execute(
         "SELECT cas, name, bp_c, formula, molar_mass_g_mol, source, updated_at FROM results WHERE cas=?",
         (cas,),
@@ -227,7 +242,7 @@ def cache_put(
     molar_mass_g_mol: Optional[float] = None,
     source: str = "",
 ):
-    """Store NMVOC classification result in cache."""
+    """Store VOC classification result in cache."""
     conn.execute(
         "INSERT OR REPLACE INTO results (cas, name, bp_c, formula, molar_mass_g_mol, source, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (cas, name, bp_c, formula, molar_mass_g_mol, source, dt.datetime.now(dt.timezone.utc).isoformat()),
@@ -321,30 +336,56 @@ def has_carbon(formula: Optional[str]) -> bool:
     return match is not None
 
 
-def classify_nmvoc(
+def count_carbon_atoms(formula: Optional[str]) -> int:
+    """Count the number of carbon atoms in a molecular formula.
+    
+    Args:
+        formula: Molecular formula string (e.g., "C6H14", "NaCl", "H2O")
+    
+    Returns:
+        Number of carbon atoms (0 if no carbon or formula is None)
+    """
+    if not formula:
+        return 0
+    
+    formula = str(formula).strip()
+    # Find all occurrences of C followed by optional digits, but not Cl, Ca, Cd, etc.
+    matches = re.findall(r'C(?![a-z])(\d*)', formula)
+    
+    total_carbons = 0
+    for match in matches:
+        if match == '':
+            total_carbons += 1  # Single C without a number means 1
+        else:
+            total_carbons += int(match)
+    
+    return total_carbons
+
+
+def classify_voc(
     bp_c: Optional[float],
     has_formula: bool,
     is_organic: bool,
     threshold_c: float = DEFAULT_THRESHOLD_C,
 ) -> Tuple[str, str]:
-    """Classify compound as NMVOC, NOT_NMVOC, or UNKNOWN.
+    """Classify compound as VOC, NOT_VOC, or UNKNOWN.
     
     Logic:
-    - NMVOC: organic AND bp < 250°C
-    - NOT_NMVOC: bp >= 250°C OR (formula exists AND not organic)
+    - VOC: organic AND bp < 250°C
+    - NOT_VOC: bp >= 250°C OR (formula exists AND not organic)
     - UNKNOWN: formula unavailable AND (bp unavailable OR bp < 250°C)
     """
-    # Case 1: BP >= 250°C -> NOT_NMVOC
+    # Case 1: BP >= 250°C -> NOT_VOC
     if bp_c is not None and bp_c >= threshold_c:
-        return "NOT_NMVOC", f"BP {bp_c:.2f}°C >= {threshold_c}°C"
+        return "NOT_VOC", f"BP {bp_c:.2f}°C >= {threshold_c}°C"
     
-    # Case 2: Formula available and not organic -> NOT_NMVOC
+    # Case 2: Formula available and not organic -> NOT_VOC
     if has_formula and not is_organic:
-        return "NOT_NMVOC", "Not organic (no carbon in formula)"
+        return "NOT_VOC", "Not organic (no carbon in formula)"
     
-    # Case 3: Formula available AND organic AND BP < 250°C -> NMVOC
+    # Case 3: Formula available AND organic AND BP < 250°C -> VOC
     if has_formula and is_organic and bp_c is not None and bp_c < threshold_c:
-        return "NMVOC", f"Organic + BP {bp_c:.2f}°C < {threshold_c}°C"
+        return "VOC", f"Organic + BP {bp_c:.2f}°C < {threshold_c}°C"
     
     # Case 4: No formula -> UNKNOWN
     if not has_formula:
@@ -391,97 +432,130 @@ def is_valid_cas(cas: str) -> bool:
 
 # Online lookup helpers
 
+
 def pubchem_fetch(cas: str, timeout: float = 8.0) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """Fetch formula, molar mass, and boiling point from PubChem REST API.
-    
+    """Fetch formula, molar mass, and boiling point from PubChem.
+
+    Notes:
+        PubChem's "compound" endpoints (PUG REST) reliably provide formula/MW via the
+        Property API, but experimental boiling points are typically exposed via the
+        PUG View (record) API. This function therefore:
+
+        1) Resolves CAS (RN) -> CID
+        2) Fetches MolecularFormula + MolecularWeight via the Property API
+        3) Tries to extract a Boiling Point (°C) from the PUG View record
+
     Args:
-        cas: CAS number string
+        cas: CAS number string (ideally normalized, e.g. '7732-18-5')
         timeout: Request timeout in seconds
-    
+
     Returns:
-        Tuple of (formula, molar_mass_g_mol, bp_c) where any may be None
+        Tuple of (formula, molar_mass_g_mol, bp_c) where any may be None.
+
+    Raises:
+        RuntimeError: if the CAS cannot be resolved or PubChem is unavailable.
     """
-    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{cas}/JSON"
+    cas = str(cas).strip()
+
+    # 1) Resolve CAS RN -> CID
+    url_cid = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/xref/rn/{cas}/cids/JSON"
     try:
-        r = requests.get(url, timeout=timeout)
+        r = requests.get(url_cid, timeout=timeout)
         r.raise_for_status()
-        data = r.json()
+        cid_data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"PubChem RN->CID lookup failed ({type(e).__name__})") from e
+
+    cids = (cid_data.get("IdentifierList", {}) or {}).get("CID", []) or []
+    if not cids:
+        raise RuntimeError("PubChem returned no CID for this CAS (RN)")
+
+    cid = cids[0]
+
+    # 2) Fetch formula + MW (reliable)
+    formula: Optional[str] = None
+    mw: Optional[float] = None
+    url_props = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/MolecularFormula,MolecularWeight/JSON"
+    try:
+        r = requests.get(url_props, timeout=timeout)
+        r.raise_for_status()
+        props = r.json().get("PropertyTable", {}).get("Properties", []) or []
+        if props:
+            p0 = props[0] or {}
+            formula = p0.get("MolecularFormula")
+            mw_val = p0.get("MolecularWeight")
+            if mw_val is not None:
+                try:
+                    mw = float(mw_val)
+                except Exception:
+                    mw = None
     except Exception:
-        return None, None, None
+        # Keep going; boiling point might still be available
+        pass
 
-    def find_sections(sections, target):
-        """Recursively find sections by heading."""
-        for s in sections:
-            if s.get("TOCHeading") == target:
-                yield s
-            for sub in find_sections(s.get("Section", []) or [], target):
-                yield sub
+    # 3) Extract boiling point from PUG View record (best-effort)
+    bp_c: Optional[float] = None
+    url_view = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/{cid}/JSON"
+    try:
+        r = requests.get(url_view, timeout=timeout)
+        r.raise_for_status()
+        view = r.json()
+    except Exception:
+        return formula, mw, None
 
-    def first_boil_c(sections):
-        """Extract first boiling point in Celsius from sections."""
-        for sec in find_sections(sections, "Boiling Point"):
-            infos = sec.get("Information", []) or []
-            for info in infos:
-                vals = info.get("Value", {}).get("StringWithMarkup", []) or []
-                for v in vals:
-                    txt = v.get("String", "")
-                    if "°C" in txt:
-                        try:
-                            num = float(txt.split("°C")[0].strip().replace(",", ""))
-                            return num
-                        except Exception:
-                            pass
+    def iter_sections(sec_list):
+        for s in sec_list or []:
+            yield s
+            yield from iter_sections(s.get("Section"))
+
+    record = view.get("Record", {}) or {}
+    for sec in iter_sections(record.get("Section")):
+        if sec.get("TOCHeading") != "Boiling Point":
+            continue
+        infos = sec.get("Information", []) or []
+        for info in infos:
+            vals = (info.get("Value", {}) or {}).get("StringWithMarkup", []) or []
+            for v in vals:
+                txt = (v.get("String") or "").strip()
+                if not txt:
+                    continue
+                # Common patterns: "117 °C", "117.3 °C", sometimes with commas
+                if "°C" in txt:
+                    left = txt.split("°C")[0].strip()
+                    left = left.replace(",", "")
                     try:
-                        num = float(txt.strip().replace(",", ""))
-                        return num
+                        bp_c = float(left)
+                        break
                     except Exception:
                         pass
-        return None
-
-    record = data.get("PC_Compounds", [{}])[0]
-    props = record.get("props", []) or []
-
-    # Extract formula and molar mass from props
-    formula = None
-    mw = None
-    for p in props:
-        urn = p.get("urn", {})
-        name = urn.get("name")
-        if name == "Molecular Formula" and not formula:
-            sval = p.get("value", {}).get("sval")
-            if sval:
-                formula = sval.strip()
-        if name == "Molecular Weight" and mw is None:
-            fval = p.get("value", {}).get("fval")
-            if fval is not None:
-                mw = float(fval)
-
-    # Extract boiling point from experimental properties
-    sections = record.get("section", []) or []
-    bp_c = first_boil_c(sections)
+            if bp_c is not None:
+                break
+        if bp_c is not None:
+            break
 
     return formula, mw, bp_c
 
 
-class NMVOCFilter(FilterRule):
-    """Filter flows by NMVOC classification using boiling point and organic content.
+
+class VOCFilter(FilterRule):
+    """Filter flows by VOC classification using boiling point and organic content.
     
-    This filter classifies substances as NMVOC (Non-Methane Volatile Organic Compounds)
+    This filter classifies substances as VOC (Volatile Organic Compounds)
     based on their boiling point and molecular formula using the chemicals library.
     Can optionally use PubChem online lookups for UNKNOWN flows.
     """
     
     def __init__(
         self,
-        nmvoc_status: str = "NMVOC",
-        cache_db: str = "nmvoc_cache.sqlite",
+        voc_status: str = "VOC",
+        cache_db: str = "voc_cache.sqlite",
         threshold_c: float = DEFAULT_THRESHOLD_C,
         allow_estimates: bool = False,
         online_lookup: bool = False,
     ):
         """
         Args:
-            nmvoc_status: Classification to filter for ("NMVOC", "NOT_NMVOC", "UNKNOWN")
+            voc_status: Classification to filter for ("VOC", "NOT_VOC", "UNKNOWN")
             cache_db: Path to SQLite cache database
             threshold_c: Boiling point threshold in Celsius (default 250°C)
             allow_estimates: Allow JOBACK estimates for boiling point
@@ -493,20 +567,21 @@ class NMVOCFilter(FilterRule):
                 "Install with: pip install chemicals"
             )
         
-        self.nmvoc_status = nmvoc_status
+        self.voc_status = voc_status
         self.cache_db = cache_db
         self.threshold_c = threshold_c
         self.allow_estimates = allow_estimates
         self.online_lookup = online_lookup
         self._classification_cache = {}
     
-    def _make_cache_entry(self, status: str, formula: Optional[str], bp_c: Optional[float], source: str) -> Dict[str, Any]:
+    def _make_cache_entry(self, status: str, formula: Optional[str], bp_c: Optional[float], source: str, molar_mass: Optional[float] = None) -> Dict[str, Any]:
         """Helper to create cache dictionary entry."""
         return {
             "status": status,
             "formula": formula,
             "bp_c": bp_c,
-            "source": source
+            "source": source,
+            "molar_mass": molar_mass
         }
     
     def _set_cached(
@@ -521,7 +596,7 @@ class NMVOCFilter(FilterRule):
         molar_mass: Optional[float] = None,
     ) -> Tuple[str, Optional[str], Optional[float], Optional[str]]:
         """Update in-memory cache and optionally SQLite; return tuple."""
-        self._classification_cache[cas] = self._make_cache_entry(status, formula, bp_c, source)
+        self._classification_cache[cas] = self._make_cache_entry(status, formula, bp_c, source, molar_mass)
         if write_db:
             with closing(init_cache(self.cache_db)) as conn:
                 cache_put(conn, cas, "", bp_c, formula, molar_mass, source)
@@ -530,7 +605,8 @@ class NMVOCFilter(FilterRule):
 
     def _classify_flow_offline(self, cas: str) -> Tuple[str, Optional[str], Optional[float], Optional[str]]:
         """Classify using offline data only. Returns (status, formula, bp_c, source)."""
-        cas = str(cas).strip()
+        cas = normalize_cas(cas) if cas is not None else None
+        cas = str(cas).strip() if cas is not None else ""
 
         if cas in self._classification_cache:
             cached = self._classification_cache[cas]
@@ -543,20 +619,20 @@ class NMVOCFilter(FilterRule):
             cached_db = cache_get(conn, cas)
             if cached_db is not None:
                 is_organic = has_carbon(cached_db["formula"])
-                status, _ = classify_nmvoc(
+                status, _ = classify_voc(
                     bp_c=cached_db["bp_c"],
                     has_formula=cached_db["formula"] is not None,
                     is_organic=is_organic,
                     threshold_c=self.threshold_c,
                 )
-                return self._set_cached(cas, status, cached_db["formula"], cached_db["bp_c"], cached_db["source"])
+                return self._set_cached(cas, status, cached_db["formula"], cached_db["bp_c"], cached_db["source"], molar_mass=cached_db.get("molar_mass"))
 
             bp_c, _ = offline_bp_lookup_c(cas, allow_estimates=self.allow_estimates)
             formula, _ = offline_formula_lookup(cas)
             molar_mass, _ = offline_molar_mass_lookup(cas)
 
             is_organic = has_carbon(formula)
-            status, _ = classify_nmvoc(
+            status, _ = classify_voc(
                 bp_c=bp_c,
                 has_formula=formula is not None,
                 is_organic=is_organic,
@@ -566,15 +642,17 @@ class NMVOCFilter(FilterRule):
             source = f"BP:{'chemicals' if bp_c is not None else 'unavailable'} | Formula:{'chemicals' if formula is not None else 'unavailable'}"
             cache_put(conn, cas, "", bp_c, formula, molar_mass, source)
 
-        return self._set_cached(cas, status, formula, bp_c, source)
+        return self._set_cached(cas, status, formula, bp_c, source, molar_mass=molar_mass)
 
-    def _classify_flow_online(self, cas: str) -> Tuple[str, Optional[str], Optional[float], Optional[str]]:
-        """Attempt online classification using PubChem. Returns (status, formula, bp_c, source)."""
+    def _classify_flow_online(self, cas: str) -> Tuple[str, Optional[str], Optional[float], Optional[str], Optional[float]]:
+        """Attempt online classification using PubChem. Returns (status, formula, bp_c, source, molar_mass)."""
+        cas = normalize_cas(cas) if cas is not None else None
+        cas = str(cas).strip() if cas is not None else ""
         try:
             formula, molar_mass, bp_c = pubchem_fetch(cas, timeout=8.0)
             is_organic = has_carbon(formula)
 
-            status, _ = classify_nmvoc(
+            status, _ = classify_voc(
                 bp_c=bp_c,
                 has_formula=formula is not None,
                 is_organic=is_organic,
@@ -582,19 +660,28 @@ class NMVOCFilter(FilterRule):
             )
 
             source = f"BP:{'pubchem' if bp_c is not None else 'unavailable'} | Formula:{'pubchem' if formula is not None else 'unavailable'}"
-            return status, formula, bp_c, source
-        except Exception:
-            return "UNKNOWN", None, None, "online lookup failed"
+            return status, formula, bp_c, source, molar_mass
+        except Exception as e:
+            return "UNKNOWN", None, None, f"online lookup failed: {type(e).__name__}: {e}", None
 
     def _classify_flow(self, cas: str) -> str:
-        """Classify a single CAS number and return its NMVOC status."""
-        cas = str(cas).strip()
+        """Classify a single CAS number and return its VOC status."""
+        cas = normalize_cas(cas) if cas is not None else None
+        cas = str(cas).strip() if cas is not None else ""
 
         status, formula, bp_c, source = self._classify_flow_offline(cas)
 
         if status == "UNKNOWN" and self.online_lookup:
-            online_status, online_formula, online_bp_c, online_source = self._classify_flow_online(cas)
-            if online_status in ("NMVOC", "NOT_NMVOC"):
+            online_status, online_formula, online_bp_c, online_source, online_molar_mass = self._classify_flow_online(cas)
+
+            # If the online lookup returns *any* enrichment (formula and/or BP), cache it
+            # even if the final classification remains UNKNOWN. This makes the behavior
+            # observable and avoids repeating lookups in future runs.
+            if (
+                online_status in ("VOC", "NOT_VOC")
+                or online_formula is not None
+                or online_bp_c is not None
+            ):
                 status, formula, bp_c, source = self._set_cached(
                     cas,
                     online_status,
@@ -602,15 +689,21 @@ class NMVOCFilter(FilterRule):
                     online_bp_c,
                     online_source,
                     write_db=True,
+                    molar_mass=online_molar_mass,
                 )
 
         return status
     
     def apply(self, flow: dict) -> bool:
-        """Return True if flow matches the desired NMVOC status."""
-        cas = flow.get("CAS")
+        """Return True if flow matches the desired VOC status and add carbon atom count."""
+        cas = normalize_cas(flow.get("CAS"))
         if not cas:
-            return self.nmvoc_status == "UNKNOWN"
+            return self.voc_status == "UNKNOWN"
         
         status = self._classify_flow(cas)
-        return status == self.nmvoc_status
+        
+        # Add carbon atom count to the flow
+        formula = self._classification_cache.get(cas, {}).get("formula")
+        flow["carbon_atoms"] = count_carbon_atoms(formula)
+        
+        return status == self.voc_status
