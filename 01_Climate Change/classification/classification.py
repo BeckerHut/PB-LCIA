@@ -64,9 +64,10 @@ def classify(df, df_ar6, ar6_cols, online_lookup=False):
     
     clf = VOCFilter("UNKNOWN", online_lookup=online_lookup, cache_db="voc_cache.sqlite")
     
-    def classify_with_details(cas):
-        cas = normalize_cas(cas)
-        status = clf._classify_flow(cas)
+    def classify_with_details(row):
+        cas = normalize_cas(row.get("CAS"))
+        flow_name = row.get("name")
+        status = clf._classify_flow(cas, flow_name=flow_name)
         entry = clf._classification_cache.get(cas, {})
         return pd.Series({
             "formula": entry.get("formula"),
@@ -77,7 +78,7 @@ def classify(df, df_ar6, ar6_cols, online_lookup=False):
             "Molar mass [g mol-1]": entry.get("molar_mass"),
         })
     
-    details = df_cas["CAS"].apply(classify_with_details)
+    details = df_cas.apply(classify_with_details, axis=1)
     for col in details.columns:
         df_cas[col] = details[col].values
     

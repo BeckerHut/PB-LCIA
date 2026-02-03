@@ -367,14 +367,48 @@ def classify_voc(
     has_formula: bool,
     is_organic: bool,
     threshold_c: float = DEFAULT_THRESHOLD_C,
+    flow_name: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Classify compound as VOC, NOT_VOC, or UNKNOWN.
     
     Logic:
+    - Step 0: Check inclusion list -> VOC, then exclusion list -> NOT_VOC
     - VOC: organic AND bp < 250°C
     - NOT_VOC: bp >= 250°C OR (formula exists AND not organic)
     - UNKNOWN: formula unavailable AND (bp unavailable OR bp < 250°C)
     """
+    # Inclusion list for Step 0 (case-insensitive substring match)
+    INCLUDED_NAMES = {
+        "carbon monoxide",
+    }
+
+    # Exclusion list for Step 0
+    EXCLUDED_NAMES = {
+        "Ammonium carbonate",
+        "Bicarbonate",
+        "Boron carbide",
+        "Carbon-14",
+        "Carbon disulfide",
+        "Carbonate",
+        "Carbonyl sulfide",
+        "Cyanide",
+        "Elemental carbon",
+        "Graphite",
+        "Lithium carbonate",
+        "Phosgene",
+        "Thiocyanate"
+    }
+    
+    # Case 0a: Check if flow name matches inclusion list -> VOC
+    if flow_name is not None:
+        flow_name_lower = flow_name.lower()
+        if any(name in flow_name_lower for name in INCLUDED_NAMES):
+            return "VOC", f"Included by name: {flow_name}"
+
+    # Case 0b: Check if flow name is in exclusion list -> NOT_VOC
+    if flow_name is not None and flow_name in EXCLUDED_NAMES:
+        return "NOT_VOC", f"Excluded by name: {flow_name}"
+    
     # Case 1: BP >= 250°C -> NOT_VOC
     if bp_c is not None and bp_c >= threshold_c:
         return "NOT_VOC", f"BP {bp_c:.2f}°C >= {threshold_c}°C"
@@ -603,7 +637,7 @@ class VOCFilter(FilterRule):
         cached = self._classification_cache[cas]
         return cached["status"], cached["formula"], cached["bp_c"], cached["source"]
 
-    def _classify_flow_offline(self, cas: str) -> Tuple[str, Optional[str], Optional[float], Optional[str]]:
+    def _classify_flow_offline(self, cas: str, flow_name: Optional[str] = None) -> Tuple[str, Optional[str], Optional[float], Optional[str]]:
         """Classify using offline data only. Returns (status, formula, bp_c, source)."""
         cas = normalize_cas(cas) if cas is not None else None
         cas = str(cas).strip() if cas is not None else ""
@@ -624,6 +658,7 @@ class VOCFilter(FilterRule):
                     has_formula=cached_db["formula"] is not None,
                     is_organic=is_organic,
                     threshold_c=self.threshold_c,
+                    flow_name=flow_name,
                 )
                 return self._set_cached(cas, status, cached_db["formula"], cached_db["bp_c"], cached_db["source"], molar_mass=cached_db.get("molar_mass"))
 
@@ -637,6 +672,7 @@ class VOCFilter(FilterRule):
                 has_formula=formula is not None,
                 is_organic=is_organic,
                 threshold_c=self.threshold_c,
+                flow_name=flow_name,
             )
 
             source = f"BP:{'chemicals' if bp_c is not None else 'unavailable'} | Formula:{'chemicals' if formula is not None else 'unavailable'}"
@@ -644,7 +680,7 @@ class VOCFilter(FilterRule):
 
         return self._set_cached(cas, status, formula, bp_c, source, molar_mass=molar_mass)
 
-    def _classify_flow_online(self, cas: str) -> Tuple[str, Optional[str], Optional[float], Optional[str], Optional[float]]:
+    def _classify_flow_online(self, cas: str, flow_name: Optional[str] = None) -> Tuple[str, Optional[str], Optional[float], Optional[str], Optional[float]]:
         """Attempt online classification using PubChem. Returns (status, formula, bp_c, source, molar_mass)."""
         cas = normalize_cas(cas) if cas is not None else None
         cas = str(cas).strip() if cas is not None else ""
@@ -657,6 +693,7 @@ class VOCFilter(FilterRule):
                 has_formula=formula is not None,
                 is_organic=is_organic,
                 threshold_c=self.threshold_c,
+                flow_name=flow_name,
             )
 
             source = f"BP:{'pubchem' if bp_c is not None else 'unavailable'} | Formula:{'pubchem' if formula is not None else 'unavailable'}"
@@ -664,15 +701,15 @@ class VOCFilter(FilterRule):
         except Exception as e:
             return "UNKNOWN", None, None, f"online lookup failed: {type(e).__name__}: {e}", None
 
-    def _classify_flow(self, cas: str) -> str:
+    def _classify_flow(self, cas: str, flow_name: Optional[str] = None) -> str:
         """Classify a single CAS number and return its VOC status."""
         cas = normalize_cas(cas) if cas is not None else None
         cas = str(cas).strip() if cas is not None else ""
 
-        status, formula, bp_c, source = self._classify_flow_offline(cas)
+        status, formula, bp_c, source = self._classify_flow_offline(cas, flow_name=flow_name)
 
         if status == "UNKNOWN" and self.online_lookup:
-            online_status, online_formula, online_bp_c, online_source, online_molar_mass = self._classify_flow_online(cas)
+            online_status, online_formula, online_bp_c, online_source, online_molar_mass = self._classify_flow_online(cas, flow_name=flow_name)
 
             # If the online lookup returns *any* enrichment (formula and/or BP), cache it
             # even if the final classification remains UNKNOWN. This makes the behavior
@@ -700,7 +737,8 @@ class VOCFilter(FilterRule):
         if not cas:
             return self.voc_status == "UNKNOWN"
         
-        status = self._classify_flow(cas)
+        flow_name = flow.get("name")
+        status = self._classify_flow(cas, flow_name=flow_name)
         
         # Add carbon atom count to the flow
         formula = self._classification_cache.get(cas, {}).get("formula")
