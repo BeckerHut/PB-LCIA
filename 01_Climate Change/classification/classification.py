@@ -10,7 +10,7 @@ from .flow_matching import match_flows
 Module for classifying relevant elementary flows for Climate Change characterization
 """
 
-def classify(df, df_ar6, ar6_cols, online_lookup=False):
+def classify(df, df_ar6, ar6_cols, df_wmo, wmo_cols, online_lookup=False):
     """
     Classify air compartment flows into VOC and GHG categories.
     
@@ -103,7 +103,7 @@ def classify(df, df_ar6, ar6_cols, online_lookup=False):
             break
     
     # Match VOC flows against AR6 table
-    matched_voc, not_matched_voc = match_flows(
+    matched_voc_ar6, unmatched_voc_ar6 = match_flows(
         df_voc,
         df_ar6,
         flow_cas_col=flow_cas_col,
@@ -114,6 +114,18 @@ def classify(df, df_ar6, ar6_cols, online_lookup=False):
         }
     )
     
+    # Match not_matched_voc flows against WMO table 
+    matched_voc_wmo, unmatched_voc_wmo = match_flows(
+        unmatched_voc_ar6,
+        df_wmo,
+        flow_cas_col=flow_cas_col,
+        ar6_cas_col=wmo_cols['cas'],
+        ar6_cols={
+            'lifetime': wmo_cols['lifetime'],
+            'rad_eff': wmo_cols['rad_eff'],
+        }
+    )
+
     # Match NOT_VOC flows against AR6 table
     matched_not_voc, not_matched_not_voc = match_flows(
         df_not_voc,
@@ -137,9 +149,12 @@ def classify(df, df_ar6, ar6_cols, online_lookup=False):
         }
     )
     
-    # Step 7: Organize results
-    df_voc_lt = matched_voc
-    df_voc_nolt = not_matched_voc.reset_index(drop=True)
+
+
+    # Step 6: Organize results
+    df_voc_lt = pd.concat([matched_voc_ar6, matched_voc_wmo], ignore_index=True) 
+
+    df_voc_nolt = pd.concat([unmatched_voc_ar6, unmatched_voc_wmo], ignore_index=True)
     
     df_other_ghg = pd.concat([matched_not_voc, matched_unknown], ignore_index=True)
     

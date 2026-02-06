@@ -372,17 +372,23 @@ def classify_voc(
     """Classify compound as VOC, NOT_VOC, or UNKNOWN.
     
     Logic:
-    - Step 0: Check inclusion list -> VOC, then exclusion list -> NOT_VOC
-    - VOC: organic AND bp < 250°C
-    - NOT_VOC: bp >= 250°C OR (formula exists AND not organic)
+    - VOC: (organic AND bp < 250°C), 
+            also includes carbon monoxide
+    - NOT_VOC: bp >= 250°C OR (formula exists AND not organic) 
+            and includes all substances with carbon content but considered not organic
     - UNKNOWN: formula unavailable AND (bp unavailable OR bp < 250°C)
     """
-    # Inclusion list for Step 0 (case-insensitive substring match)
+    # Inclusion list for Step 1
+    """CO is not a VOC but acts also as CO2 precursor 
+    and is therefore characterized the same way"""
+
     INCLUDED_NAMES = {
         "carbon monoxide",
     }
 
-    # Exclusion list for Step 0
+    # Exclusion list for Step 2
+    """These substances contain carbon but are not considered VOCs"""
+
     EXCLUDED_NAMES = {
         "Ammonium carbonate",
         "Bicarbonate",
@@ -399,29 +405,29 @@ def classify_voc(
         "Thiocyanate"
     }
     
-    # Case 0a: Check if flow name matches inclusion list -> VOC
+    # Case 1: Check if flow name matches inclusion list -> VOC
     if flow_name is not None:
         flow_name_lower = flow_name.lower()
         if any(name in flow_name_lower for name in INCLUDED_NAMES):
             return "VOC", f"Included by name: {flow_name}"
 
-    # Case 0b: Check if flow name is in exclusion list -> NOT_VOC
+    # Case 2: Check if flow name matches exclusion list -> NOT_VOC
     if flow_name is not None and flow_name in EXCLUDED_NAMES:
         return "NOT_VOC", f"Excluded by name: {flow_name}"
     
-    # Case 1: BP >= 250°C -> NOT_VOC
+    # Case 3: BP >= 250°C -> NOT_VOC
     if bp_c is not None and bp_c >= threshold_c:
         return "NOT_VOC", f"BP {bp_c:.2f}°C >= {threshold_c}°C"
     
-    # Case 2: Formula available and not organic -> NOT_VOC
+    # Case 4: Formula available and not organic -> NOT_VOC
     if has_formula and not is_organic:
         return "NOT_VOC", "Not organic (no carbon in formula)"
     
-    # Case 3: Formula available AND organic AND BP < 250°C -> VOC
+    # Case 5: Formula available AND organic AND BP < 250°C -> VOC
     if has_formula and is_organic and bp_c is not None and bp_c < threshold_c:
         return "VOC", f"Organic + BP {bp_c:.2f}°C < {threshold_c}°C"
     
-    # Case 4: No formula -> UNKNOWN
+    # Case 6: No formula -> UNKNOWN
     if not has_formula:
         if bp_c is not None and bp_c < threshold_c:
             return "UNKNOWN", "Formula unavailable, BP < 250°C"

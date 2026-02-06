@@ -1,6 +1,11 @@
 import pandas as pd
 import requests
 from io import StringIO
+import re
+import numpy as np
+import os
+import tabula
+
 from classification.filters import normalize_cas
 
 
@@ -22,6 +27,171 @@ def prepare_ar6_data():
     df_ar6, _ = enrich_ar6_with_hodnebrog(df_ar6, df_hodne, ar6_cols, hodne_cols)
 
     return df_ar6, ar6_cols
+
+
+def prepare_wmo_data(pdf_path: str = None):
+    """
+    Extract and prepare WMO 2022 Ozone Assessment data from Table A-5.
+    
+    Args:
+        pdf_path: Path to the WMO PDF file. If None, uses default path.
+        
+    Returns:
+        Tuple of (dataframe, column_names_dict)
+        - dataframe: DataFrame with WMO data
+        - column_names: Dict with keys: 'name', 'formula', 'cas', 'lifetime', 'odp', 'rad_eff'
+    """
+    
+    # Default PDF path if not provided
+    if pdf_path is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        pdf_path = os.path.join(os.path.dirname(script_dir), "data", "01_Scientific assessment of ozone depletion 2022.pdf")
+    
+    # Helper functions
+    def to_float(x):
+        """Convert a string to float"""
+        if pd.isna(x):
+            return np.nan
+        s = str(x).strip().replace("–", "-").replace("−", "-")
+        m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+        return float(m.group(1)) if m else np.nan
+    
+    def parse_lifetime_years(x):
+        """Convert a lifetime string to years (handle days/months, assume years otherwise)"""
+        if pd.isna(x):
+            return np.nan
+        s = str(x).strip()
+        if not s:
+            return np.nan
+        s = s.replace("–", "-").replace("−", "-")
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
+        if not m:
+            return np.nan
+        val = float(m.group(1))
+        s_low = s.lower()
+        if "day" in s_low:
+            return val / 365.25
+        if "month" in s_low:
+            return val / 12.0
+        return val  # assume years
+    
+    def make_unique_columns(df):
+        """Make column names unique by appending .1, .2, etc. to duplicates"""
+        cols = df.columns.astype(str)
+        seen = {}
+        new_cols = []
+        for c in cols:
+            if c in seen:
+                seen[c] += 1
+                new_cols.append(f"{c}.{seen[c]}")
+            else:
+                seen[c] = 0
+                new_cols.append(c)
+        df = df.copy()
+        df.columns = new_cols
+        return df
+    
+    # Table A-5 spans from page 458-493
+    PAGES = "458-493"
+    
+    # Parse the PDF table into a list of dataframes
+    dfs = tabula.read_pdf(
+        pdf_path,
+        pages=PAGES,
+        multiple_tables=True,
+        lattice=True,
+        guess=True,
+        java_options=["-Djava.awt.headless=true"],
+    )
+    
+    # The tables are spanned over two pages, so we pair them up
+    paired = [
+        pd.concat([dfs[i].reset_index(drop=True), dfs[i+1].reset_index(drop=True)], axis=1)
+        for i in range(0, len(dfs), 2)
+    ]
+    
+    # The dataframes are prepared for concatenation by making their column names unique
+    paired_fixed = [make_unique_columns(df) for df in paired]
+    
+    # Concatenate all the paired tables into one long dataframe
+    # Skip the first row of each subsequent table to avoid repeating header rows
+    df = pd.concat(
+        [paired_fixed[0]] + [df.iloc[1:] for df in paired_fixed[1:]],
+        axis=0,
+        ignore_index=True
+    )
+    
+    # Turn pure-whitespace strings into NaN in all columns
+    tmp = df.replace(r"^\s*$", np.nan, regex=True)
+    
+    # Remove the headline rows
+    df = df.loc[~tmp.isna().all(axis=1)].reset_index(drop=True)
+    
+    # Only keep the columns needed and rename them
+    keep_idx = [0, 1, 2, 5, 8, 9]
+    df = df.iloc[:, keep_idx].copy()
+    df.columns = [
+        "Name",
+        "Formula",
+        "CAS",
+        "WMO (2022) Total lifetime (years)",
+        "ODP",
+        "Radiative Efficiency (well mixed) (W m–2 ppb–1)",
+    ]
+    
+    # Parse + clean the final columns
+    
+    # 1) Clean CAS: keep only valid CAS format, else NaN
+    df["CAS"] = df["CAS"].astype(str).str.strip()
+    df.loc[~df["CAS"].str.match(r"^\d{2,7}-\d{2}-\d$"), "CAS"] = np.nan
+    
+    # 2) Lifetime -> years (convert days/months to years, etc.)
+    df["WMO (2022) Total lifetime (years)"] = df["WMO (2022) Total lifetime (years)"].apply(parse_lifetime_years)
+    
+    # 3) ODP -> float
+    df["ODP"] = df["ODP"].apply(to_float)
+    
+    # 4) Radiative efficiency (well mixed) -> float
+    df["Radiative Efficiency (well mixed) (W m–2 ppb–1)"] = (
+        df["Radiative Efficiency (well mixed) (W m–2 ppb–1)"].apply(to_float)
+    )
+    
+    # 5) Clean text columns
+    df["Name"] = df["Name"].astype(str).str.strip().replace({"": np.nan})
+    df["Formula"] = df["Formula"].astype(str).str.strip().replace({"": np.nan})
+    
+    # 6) Reset continuous index
+    df.reset_index(drop=True, inplace=True)
+    
+    # 7) Merge rows with the same CAS: keep name/formula of first, max of other columns
+    has_cas = df["CAS"].notna()
+    with_cas = df[has_cas].copy()
+    no_cas = df[~has_cas].copy()
+    if not with_cas.empty:
+        merged = (
+            with_cas.groupby("CAS", as_index=False)
+            .agg({
+                "Name": "first",
+                "Formula": "first",
+                "WMO (2022) Total lifetime (years)": "max",
+                "ODP": "max",
+                "Radiative Efficiency (well mixed) (W m–2 ppb–1)": "max",
+            })
+        )
+        df = pd.concat([merged, no_cas], ignore_index=True)
+        df = df.reset_index(drop=True)
+    
+    # Create column names dictionary matching the AR6 pattern
+    column_names = {
+        'name': 'Name',
+        'formula': 'Formula',
+        'cas': 'CAS',
+        'lifetime': 'WMO (2022) Total lifetime (years)',
+        'odp': 'ODP',
+        'rad_eff': 'Radiative Efficiency (well mixed) (W m–2 ppb–1)'
+    }
+    
+    return df, column_names
 
 
 """
